@@ -1,0 +1,146 @@
+// NeuralSHCompute.usf
+// HLSL compute shader implementing the PyTorch MLP from the user's post.
+// Compile as a compute shader in Unreal. Bind buffers as described below.
+
+// --- constants (change here or set from CPU) ---
+static const uint PROBES_DIM_X = 50;
+static const uint PROBES_DIM_Y = 5;
+static const uint PROBES_DIM_Z = 5;
+static const uint PROBES_COUNT = PROBES_DIM_X * PROBES_DIM_Y * PROBES_DIM_Z; // 1250
+static const uint INPUT_FLOAT_COUNT = PROBES_COUNT + 18; // matches your py code
+static const uint SH_FLOAT_COUNT = 27;
+static const uint MLP_HIDDEN_LAYER_WIDTH = 12;
+
+static const float PI = 3.14159265358979323846;
+
+// --- Resource bindings ---
+// Set these SRV/UAV/registers up in UE when dispatching the shader.
+// Example register slots are placeholders and should be matched at dispatch time.
+
+StructuredBuffer<float3> Positions      : register(t0); // N
+StructuredBuffer<float>  Angles         : register(t1); // N
+StructuredBuffer<float>  ProbeFeatures  : register(t2); // PROBES_COUNT
+
+// Linear layer weights: store as row-major: [out_index * INPUT_FLOAT_COUNT + in_index]
+StructuredBuffer<float>  HiddenWeights  : register(t3); // MLP_HIDDEN_LAYER_WIDTH * INPUT_FLOAT_COUNT
+StructuredBuffer<float>  HiddenBias     : register(t4); // MLP_HIDDEN_LAYER_WIDTH
+
+StructuredBuffer<float>  OutputWeights  : register(t5); // SH_FLOAT_COUNT * MLP_HIDDEN_LAYER_WIDTH
+StructuredBuffer<float>  OutputBias     : register(t6); // SH_FLOAT_COUNT
+
+// Output: N * SH_FLOAT_COUNT
+RWStructuredBuffer<float> Output        : register(u0);
+
+// Number of samples (must be set from CPU)
+cbuffer ShaderParams : register(b0)
+{
+    uint NumSamples;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+}
+
+// Utility sigmoid
+float sigmoid(float x)
+{
+    // numerically stable-ish
+    return 1.0 / (1.0 + exp(-x));
+}
+
+// Compute trigonometric encoding for a float scalar value into the given out[] starting at offset.
+// Order matches PyTorch code: for i in [0..L-1] append sin(2^i * pi * x) then cos(2^i * pi * x)
+void EncodeScalarTrig(float x, uint L, out float outVals[/*max size*/ 32], inout uint writePos)
+{
+    for (uint i = 0; i < L; ++i)
+    {
+        float freq = pow(2.0, (float)i) * PI;
+        outVals[writePos++] = sin(freq * x);
+        outVals[writePos++] = cos(freq * x);
+    }
+}
+
+// Encode a float3 with L frequencies; ordering matches your PyTorch implementation.
+// PyTorch did: s = sin(2**i * pi * x) where x is shape (batch,3) -> s is 3 values,
+// and they appended s then c for each i then concatted on dim=1. That results in:
+// [s_i0_x, s_i0_y, s_i0_z, c_i0_x, c_i0_y, c_i0_z, s_i1_x, s_i1_y, s_i1_z, c_i1_x, ...]
+void EncodeVec3Trig(float3 v, uint L, out float outVals[/*max size*/ 64], inout uint writePos)
+{
+    // For each i: append sin(...) across x,y,z, then cos(...) across x,y,z
+    for (uint i = 0; i < L; ++i)
+    {
+        float freq = pow(2.0, (float)i) * PI;
+        float3 s = sin(freq * v);
+        outVals[writePos++] = s.x;
+        outVals[writePos++] = s.y;
+        outVals[writePos++] = s.z;
+
+        float3 c = cos(freq * v);
+        outVals[writePos++] = c.x;
+        outVals[writePos++] = c.y;
+        outVals[writePos++] = c.z;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint idx = dispatchThreadID.x;
+    if (idx >= NumSamples) return;
+
+    // 1) read inputs
+    float3 pos = Positions[idx];   // assumed in the same coordinate space used while training
+    float angle = Angles[idx];
+
+    // 2) build the input vector ordered exactly like the PyTorch code:
+    //    pos_enc (L=2 -> 12 floats), angle_enc (L=3 -> 6 floats), probe_features (PROBES_COUNT)
+    // We will allocate a local array large enough for INPUT_FLOAT_COUNT. HLSL doesn't support dynamic arrays,
+    // so we use a fixed upper bound. We know PROBES_COUNT=1250 so INPUT_FLOAT_COUNT <= 1270.
+    // Keep a margin to be safe.
+    float inputVec[1400]; // safe upper bound: PROBES_COUNT + 18 (1250+18=1268)
+    uint writePos = 0u;
+
+    // pos encoding L=2 (3 components). This will write 12 floats.
+    EncodeVec3Trig(pos, 2u, inputVec, writePos);
+
+    // angle encoding L=3 (single scalar). This will write 6 floats (s0,c0,s1,c1,s2,c2).
+    EncodeScalarTrig(angle, 3u, inputVec, writePos);
+
+    // probe features (append PROBES_COUNT floats)
+    // The order: probe_features[0], probe_features[1], ...
+    for (uint p = 0u; p < PROBES_COUNT; ++p)
+    {
+        inputVec[writePos++] = ProbeFeatures[p];
+    }
+
+    // Sanity check: writePos should equal INPUT_FLOAT_COUNT
+    // (No branching/printf here - host must ensure constants match.)
+    // 3) Hidden layer: hidden = sigmoid( W_hidden * input + b_hidden )
+    float hidden[MLP_HIDDEN_LAYER_WIDTH];
+    for (uint out_i = 0; out_i < MLP_HIDDEN_LAYER_WIDTH; ++out_i)
+    {
+        // HiddenWeights laid out row-major: [out_i * INPUT_FLOAT_COUNT + in_j]
+        float acc = HiddenBias[out_i];
+        uint rowBase = out_i * INPUT_FLOAT_COUNT;
+        // Unroll the dot product
+        // Note: INPUT_FLOAT_COUNT can be ~1268, keep simple loop
+        for (uint in_j = 0; in_j < INPUT_FLOAT_COUNT; ++in_j)
+        {
+            acc += HiddenWeights[rowBase + in_j] * inputVec[in_j];
+        }
+        hidden[out_i] = sigmoid(acc);
+    }
+
+    // 4) Output layer: out = W_out * hidden + b_out, W_out row-major: [out_k * MLP_HIDDEN_LAYER_WIDTH + hid_j]
+    // Write into Output buffer at idx * SH_FLOAT_COUNT + k
+    uint outBase = idx * SH_FLOAT_COUNT;
+    for (uint k = 0; k < SH_FLOAT_COUNT; ++k)
+    {
+        float acc = OutputBias[k];
+        uint rowBase = k * MLP_HIDDEN_LAYER_WIDTH;
+        for (uint j = 0; j < MLP_HIDDEN_LAYER_WIDTH; ++j)
+        {
+            acc += OutputWeights[rowBase + j] * hidden[j];
+        }
+        Output[outBase + k] = acc;
+    }
+}
