@@ -92,7 +92,6 @@ def _reshape_tex(flat: np.ndarray, meta: TextureMetadata, channels: int) -> np.n
   return flat.reshape((meta.depth, meta.height, meta.width, channels))
 
 
-@cache
 def load_texture(bin_path: str | Path, json_path: Optional[str | Path] = None) -> Texture:
   """Load a texture from .bin and .json metadata.
 
@@ -197,16 +196,37 @@ def _sample_trilinear(tex: Texture, u: float, v: float, w: float) -> np.ndarray:
   return _lerp(c0, c1, tz)
 
 
+def _sample_nearest(tex: Texture, u: float, v: float, w: float) -> np.ndarray:
+  depth, height, width, channels = tex.data.shape
+
+  # Map into texel space
+  x = _clamp(u * width - 0.5, 0.0, float(width - 1))
+  y = _clamp(v * height - 0.5, 0.0, float(height - 1))
+  z = _clamp(w * depth - 0.5, 0.0, float(depth - 1))
+
+  nearest_x = int(round(x))
+  nearest_y = int(round(y))
+  nearest_z = int(round(z))
+
+  c = tex.data[nearest_z, nearest_y, nearest_x]
+
+  return c
+
 def sample_uv(
   tex: Texture,
   u: float,
   v: float,
-  w: float
+  w: float,
+  method : str = "trilinear"
 ) -> np.ndarray:
   """Sample the texture at UV(W) in [0,1] using trilinear filtering.
 
   - Returns a float32 numpy array of shape (C,).
   """
 
-  return _sample_trilinear(tex, u, v, w)
-  
+  if method == "trilinear":
+    return _sample_trilinear(tex, u, v, w)
+  elif method == "nearest":
+    return _sample_nearest(tex, u, v, w)
+  else:
+    raise ValueError(f"{method} not supported!")
